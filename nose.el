@@ -66,6 +66,7 @@
 ;; (define-key nose-mode-map "\C-cp." 'nosetests-pdb-one)
 
 (require 'cl) ;; for "reduce"
+(require 'noflet)
 
 (defvar nose-project-names '("eco/bin/test"))
 
@@ -86,8 +87,14 @@ project. The function should return a directory path.")
 (defvar nose-finish-functions nil
   "Functions to call when nosetests complete. See compilation-finish-functions.")
 
+(defvar nose--delayed-pop nil
+  "Whether we are delaying popping up compilation")
+
+(defvar nose--run-location nil
+  "Location where nose was last run.")
+
 (defvar nose--last-run-params nil
-  "Stores the last parameters passed to run-nose")
+  "Stores the last parameters passed to run-nose.")
 
 (defvar-local nose-local-project-root nil
   "This variable will define the project root when a 'current
@@ -95,6 +102,34 @@ file name' is inapplicable to the current buffer. An example is
 during display of nosetest results (compilation buffer.) It
 should be set local to such buffers at the time when they're
 created." )
+
+(defun nose--delayed-popup (buffer outstr)
+  (when (string= (buffer-name buffer) "*nosetests*")
+      (message (format "Calling callback %S" (list buffer outstr)))
+    (if (string-match "Compilation finished" outstr)
+        (message "Tests passed")
+      (progn
+        (switch-to-buffer-other-window buffer)))))
+
+;;http://stackoverflow.com/questions/17659212/dont-display-compilation-buffer-in-emacs-until-the-process-exits-with-error-o
+(defun nose--compilation-start (show-on-error &rest arguments)
+  "A version of compilation start that optionally only pops up the buffer on error."
+    (message "Running nose tests...")
+    (if show-on-error
+        (apply 'nose--quiet-compilation-start arguments)
+      (apply 'compilation-start arguments)))
+
+(defun nose--quiet-compilation-start (&rest arguments)
+  "A version of compilation start that optionally only pops up the buffer on error."
+  (noflet (
+           (display-buffer () )
+           (set-window-point () )
+           (goto-char ()))
+    (fset 'display-buffer 'ignore)
+    (fset 'set-window-point 'ignore)
+    (fset 'goto-char 'ignore)
+    (apply 'compilation-start arguments)))
+
 
 (define-minor-mode nose-mode
   "Minor mode enabling nosetests key commands."
@@ -113,10 +148,11 @@ created." )
 		(funcall func buffer message) )))
 
 (add-to-list 'compilation-finish-functions 'nose--finish-function-hook)
+(add-to-list 'compilation-finish-functions 'nose--delayed-popup)
 
-(defun run-nose (&optional tests debug failed)
+(defun run-nose (&optional tests debug failed show-on-error)
   "run nosetests"
-  (setq nose--last-run-params (list tests debug failed))
+  (setq nose--last-run-params (list tests debug failed show-on-error))
 
   (let* ((nose (nose-find-test-runner))
          (where (or nose-local-project-root (nose-find-project-root)))
@@ -141,7 +177,7 @@ created." )
                   (let ((compilation-error-regexp-alist
                          '(("  File \"\\(.*\\)\", line \\([0-9]+\\), in test_" 1 2))))
                     (save-current-buffer
-					  (set-buffer (compilation-start command
+					  (set-buffer (nose--compilation-start show-on-error command
 													 nil
 													 (lambda (mode) (concat "*nosetests*"))))
 					  (setq-local nose-local-project-root where)))))
@@ -149,50 +185,87 @@ created." )
               (concat "%s "
                       (if nose-use-verbose "-v " "")
                       "%s -w %s -c %ssetup.cfg %s")
-              nose args where where tnames)))
-  )
+              nose args where where tnames))))
+
+(defun nosetests-run (&optional mode debug show-on-error)
+  "General purpose function to run tests
+MODE is on of `all' for all tests, `failed' for tests that failed last time,
+`module' for the current module or, `one' for the current test.
+DEBUG is `t' if you want to run pdb.
+If SHOW-ON-ERROR is `t` only show the compilation window on failure.
+"
+  (interactive)
+  (setq mode (or mode 'all))
+  (when (and debug show-on-error)
+      (error "debug and show-on-error cannot both be set"))
+  (cond
+   ((equal mode 'all)
+    (setq nose--last-run-location nil)
+    (run-nose nil debug nil show-on-error))
+   ((equal mode 'failed)
+    (setq nose--last-run-location nil)
+    (run-nose nil debug 't show-on-error))
+   ((equal mode 'module)
+    (setq nose--last-run-location (list (current-buffer) nil))
+    (run-nose buffer-file-name debug show-on-error))
+   ((equal mode 'one)
+    (setq nose--last-run-location (list (current-buffer) (point)))
+    (run-nose (format "%s:%s" buffer-file-name (nose-py-testable)) debug show-on-error))
+   (t (error "mode must be one of 'all, 'failed, 'module or 'one"))))
 
 (defun nosetests-all (&optional debug failed)
   "run all tests"
   (interactive)
-  (run-nose nil debug failed))
+  (let (mode)
+    (interactive)
+    (setq mode (if failed 'failed 'all))
+    (nosetests-run mode debug)))
 
 (defun nosetests-failed (&optional debug)
   "run nosetests with the --failed option"
   (interactive)
-  (nosetests-all debug t))
+  (setq nose--last-run-location nil)
+  (nosetests-run 'failed debug))
 
 (defun nosetests-pdb-all ()
   "run all tests using the python debugger"
   (interactive)
-  (nosetests-all t))
+  (nosetests-run 'all t))
 
 (defun nosetests-module (&optional debug)
   "run nosetests (via eggs/bin/test) on current buffer"
   (interactive)
-  (run-nose buffer-file-name debug))
+  (nosetests-run 'module debug))
 
 (defun nosetests-pdb-module ()
   "run tests in the current buffer using the Python debugger"
   (interactive)
-  (nosetests-module t))
+  (nosetests-run 'module t))
 
 (defun nosetests-one (&optional debug)
   "run nosetests (via eggs/bin/test) on testable thing
  at point in current buffer"
   (interactive)
-  (run-nose (format "%s:%s" buffer-file-name (nose-py-testable)) debug))
+  (nosetests-run 'one debug))
 
 (defun nosetests-pdb-one ()
   "run nosetests (via eggs/bin/test) on testable thing
  at point in current buffer using the Python debugger"
   (interactive)
-  (nosetests-one t))
+  (nosetests-run 'one t))
 
 (defun nosetests-again ()
   "runs the most recently executed 'nosetests' command again"
   (interactive)
   (apply 'run-nose nose--last-run-params))
+
+(defun nosetests-jump ()
+  "jump to the last test run"
+  (interactive)
+  (when nose--run-location
+    (switch-to-buffer (car nose--run-location))
+      (when (cadr nose--run-location)
+          (goto-char (cadr nose--run-location)))))
 
 (defun nose-find-test-runner ()
   (message
